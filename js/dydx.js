@@ -2,6 +2,7 @@
 
 // ----------------------------------------------------------------------------
 
+const crypto = require('crypto');
 const Exchange = require ('./base/Exchange');
 const { ExchangeNotAvailable, AuthenticationError, BadSymbol, ExchangeError, InvalidOrder, InsufficientFunds } = require ('./base/errors');
 
@@ -52,8 +53,8 @@ module.exports = class dydx extends Exchange {
                     'private': 'https://api.dydx.exchange',
                 },
                 'api': {
-                    'public': 'https://api.stage.dydx.exchange',
-                    'private': 'https://api.stage.dydx.exchange',
+                    'public': 'https://api.dydx.exchange',
+                    'private': 'https://api.dydx.exchange',
                 },
                 'www': 'https://trade.dydx.exchange/',
                 'doc': [
@@ -956,7 +957,8 @@ module.exports = class dydx extends Exchange {
         //   "startingOpenInterest": "28"
         // },
         //
-        const timestamp = this.safeInteger (ohlcv, 'startedAt');
+        ohlcv.timestamp = this.parse8601(ohlcv.startedAt);
+        const timestamp = this.safeInteger (ohlcv, 'timestamp');
         const open = this.safeNumber (ohlcv, 'open');
         const high = this.safeNumber (ohlcv, 'high');
         const low = this.safeNumber (ohlcv, 'low');
@@ -968,6 +970,7 @@ module.exports = class dydx extends Exchange {
     sign (path, api = 'private', method = 'GET', params = {}, headers = undefined, body = undefined) {
         const version = this.safeString (this.options, 'version', 'v3');
         let url = this.urls['api']['private'] + '/' + version + '/' + this.implodeParams (path, params);
+        let requestPath = '/' + version + '/' + path;
         let payload = undefined;
         headers = {
             'Content-Type': 'application/json',
@@ -975,24 +978,32 @@ module.exports = class dydx extends Exchange {
         let query = undefined;
         if (method === 'GET') {
             query = this.urlencode (params);
-            url = url + '?' + query;
+            url = url + ((query.length > 0) ? '?' + query : '');
         } else {
             body = this.json (params);
         }
-        const timestamp = this.milliseconds ();
+        const timestamp = new Date().toISOString();
         if (api === 'private') {
-            if (method === 'GET') {
-                payload = query;
-            } else {
+            if (method !== 'GET') {
                 payload = body;
             }
             if (path === 'onboarding') {
                 if (method === 'POST') {
                     // onboarding endpoint: POST /v3/onboarding
+                    headers['DYDX-TIMESTAMP'] = timestamp;
                     headers['DYDX-ETHEREUM-ADDRESS'] = this.ethereumAddress;
                     payload['action'] = 'DYDX-ONBOARDING';
                     payload['onlySignOn'] = 'https://trade.dydx.exchange';
-                    const signature = this.hmac (this.encode (payload), this.encode (this.secret));
+                    const messageString = (
+                        timestamp +
+                        method +
+                        requestPath +
+                        ((!body) ? '' : JSON.stringify(body))
+                    );
+                    const signature = crypto.createHmac(
+                        'sha256',
+                        Buffer.from(this.secret, 'base64'),
+                    ).update(messageString).digest('base64');
                     headers['DYDX-SIGNATURE'] = signature; // EIP-712-compliant Ethereum signature
                 }
             } else if (method === 'DELETE') {
@@ -1004,7 +1015,16 @@ module.exports = class dydx extends Exchange {
                     payload['requestPath'] = '/v3/api-keys';
                     payload['body'] = ''; // empty for GET and DELETE
                     payload['timestamp'] = timestamp;
-                    const signature = this.hmac (this.encode (payload), this.encode (this.secret));
+                    const messageString = (
+                        timestamp +
+                        method +
+                        requestPath +
+                        ((!body) ? '' : JSON.stringify(body))
+                    );
+                    const signature = crypto.createHmac(
+                        'sha256',
+                        Buffer.from(this.secret, 'base64'),
+                    ).update(messageString).digest('base64');
                     headers['DYDX-SIGNATURE'] = signature; // EIP-712-compliant Ethereum signature
                 }
             } else {
@@ -1012,7 +1032,17 @@ module.exports = class dydx extends Exchange {
                 headers['DYDX-TIMESTAMP'] = timestamp;
                 headers['DYDX-ETHEREUM-ADDRESS'] = this.ethereumAddress;
                 headers['DYDX-PASSPHRASE'] = this.passPhrase;
-                const signature = this.hmac (this.encode (payload), this.encode (this.secret));
+                headers['DYDX-API-KEY'] = this.apiKey;
+                const messageString = (
+                    timestamp +
+                    method +
+                    requestPath +
+                    ((!body) ? '' : JSON.stringify(body))
+                );
+                const signature = crypto.createHmac(
+                    'sha256',
+                    Buffer.from(this.secret, 'base64'),
+                ).update(messageString).digest('base64');
                 headers['DYDX-SIGNATURE'] = signature; // SHA-256 HMAC produced as described below, and encoded as a Base64 string
             }
         }
