@@ -4,6 +4,7 @@
 
 const crypto = require('crypto');
 const Exchange = require ('./base/Exchange');
+const { SignableOrder, asSimpleKeyPair, asEcKeyPair } = require('@dydxprotocol/starkex-lib');
 const { ExchangeNotAvailable, AuthenticationError, BadSymbol, ExchangeError, InvalidOrder, InsufficientFunds } = require ('./base/errors');
 
 // ----------------------------------------------------------------------------
@@ -84,9 +85,11 @@ module.exports = class dydx extends Exchange {
                         'api-keys',
                         'users',
                         'accounts',
+                        'accounts/{id}',
                         'positions',
                         'transfers',
                         'orders',
+                        'orders/{id}',
                         'orders/client',
                         'fills',
                         'funding',
@@ -101,7 +104,7 @@ module.exports = class dydx extends Exchange {
                     ],
                     'delete': [
                         'api-keys',
-                        'orders',
+                        'orders/{id}',
                     ],
                     'put': [
                         'users',
@@ -137,6 +140,7 @@ module.exports = class dydx extends Exchange {
                 'passPhrase': true, // API Key Authentication
                 'starkKeyYCoordinate': true, // STARK Key Authentication
                 'starkKey': true, // STARK Key Authentication
+                'starkPrivateKey': true, // STARK Key Authentication
             },
         });
     }
@@ -144,27 +148,24 @@ module.exports = class dydx extends Exchange {
     async cancelOrder (id, symbol = undefined, params = {}) {
         // https://docs.dydx.exchange/?json#cancel-an-order
         await this.loadMarkets ();
-        const market = this.market (symbol);
         const request = {
-            'orderId': parseInt (id),
+            'id': id,
         };
-        const response = await this.privateDeleteOrders (this.extend (request, params));
+        const response = await this.privateDeleteOrdersId (this.extend (request, params));
         //
         //     {}
         //
-        const result = this.safeValue (response, 'result');
-        return this.parseOrder (result, market);
+        const result = this.safeValue (response, 'cancelOrder');
+        return this.parseOrder (result);
     }
 
     async createOrder (symbol, type, side, amount, price = undefined, params = {}) {
         // https://docs.dydx.exchange/?json#create-a-new-order
         await this.loadMarkets ();
         const market = this.market (symbol);
-        const size = this.safeValue (amount);
-        const postOnly = false;
-        const limitFee = undefined;
-        const expiration = undefined;
-        const accountDetails = await this.privateGetAccounts (this.ethereumAddress);
+        const size = parseFloat (this.amountToPrecision (symbol, amount)).toString();
+        const accountDetails = await this.privateGetAccounts ();
+        // const accountDetail = await this.privateGetAccountsId ({'id': this.ethereumAddress});
         // {
         //   "account": {
         //     "starkKey": "180913017c740260fea4b2c62828a4008ca8b0d6e4",
@@ -194,18 +195,34 @@ module.exports = class dydx extends Exchange {
         //     "id": "id"
         //   }
         // }
-        const data = this.safeValue (accountDetails, 'account');
-        const positionId = this.safeValue (data, 'positionId');
+        let starkKeyPair = undefined;
+        if (this.starkPrivateKey) {
+            starkKeyPair = asSimpleKeyPair(asEcKeyPair(this.starkPrivateKey));
+        }
+        const balances = this.safeValue (accountDetails, 'accounts', []);
+        const positionId = this.safeString (balances[0], 'positionId');
+        const clientId = Math.random().toString().slice(2).replace(/^0+/, '');
+        const orderToSign = {
+            humanSize: size,
+            humanPrice: price,
+            limitFee: params.limitFee,
+            market: market['id'],
+            side: side,
+            expirationIsoTimestamp: params.expiration,
+            clientId,
+            positionId,
+        };
+        const networkId = 1;
+        const starkOrder = SignableOrder.fromOrder(orderToSign, networkId);
+        const signature = await starkOrder.sign(starkKeyPair);
         const request = {
-            'positionId': positionId,
             'market': market['id'],
             'side': side,
             'type': type,
-            'postOnly': postOnly,
             'size': size,
             'price': price,
-            'limitFee': limitFee,
-            'expiration': expiration,
+            'clientId': clientId,
+            'signature': signature
         };
         // {
         //   "order": {
@@ -229,8 +246,9 @@ module.exports = class dydx extends Exchange {
         //     "cancelReason": null
         //   }
         // }
-        const response = await this.privatePostOrders (request);
-        return this.parseOrder (response, market);
+        const response = await this.privatePostOrders (this.extend (request, params));
+        const result = this.safeValue (response, 'order');
+        return this.parseOrder (result, market);
     }
 
     parseOrderType (type) {
@@ -246,49 +264,53 @@ module.exports = class dydx extends Exchange {
 
     async fetchBalance (params = {}) {
         await this.loadMarkets ();
-        const balances = await this.privateGetAccounts (params);
+        const response = await this.privateGetAccounts (params);
         //
-        // {
-        //   "account": {
-        //     "starkKey": "180913017c740260fea4b2c62828a4008ca8b0d6e4",
-        //     "positionId": "1812",
-        //     "equity": "10000",
-        //     "freeCollateral": "10000",
-        //     "quoteBalance": "10000",
-        //     "pendingDeposits": "0",
-        //     "pendingWithdrawals": "0",
-        //     "openPositions": {
-        //       "BTC-USD": {
-        //         "market": "BTC-USD",
-        //         "status": "OPEN",
-        //         "side": "LONG",
-        //         "size": "1000",
-        //         "maxSize": "1050",
-        //         "entryPrice": "100",
-        //         "exitPrice": null,
-        //         "unrealizedPnl": "50",
-        //         "realizedPnl": "100",
-        //         "createdAt": "2021-01-04T23:44:59.690Z",
-        //         "closedAt": null,
-        //         "netFunding": "500"
-        //       }
-        //     },
-        //     "accountNumber": "5",
-        //     "id": "id"
-        //   }
+        // { 
+        //     "accounts": [{
+        //         "starkKey": "180913017c740260fea4b2c62828a4008ca8b0d6e4",
+        //         "positionId": "1812",
+        //         "equity": "10000",
+        //         "freeCollateral": "10000",
+        //         "quoteBalance": "10000",
+        //         "pendingDeposits": "0",
+        //         "pendingWithdrawals": "0",
+        //         "createdAt": "2021-04-09T21:08:34.984Z",
+        //         "openPositions": {
+        //         "BTC-USD": {
+        //             "market": "BTC-USD",
+        //             "status": "OPEN",
+        //             "side": "LONG",
+        //             "size": "1000",
+        //             "maxSize": "1050",
+        //             "entryPrice": "100",
+        //             "exitPrice": null,
+        //             "unrealizedPnl": "50",
+        //             "realizedPnl": "100",
+        //             "createdAt": "2021-01-04T23:44:59.690Z",
+        //             "closedAt": null,
+        //             "netFunding": "500",
+        //             "sumOpen": "1050",
+        //             "sumClose": "50"
+        //         }
+        //         },
+        //         "accountNumber": "5",
+        //         "id": "id"
+        //     }]
         // }
         //
         const result = {
-            'info': balances,
-            'timestamp': undefined,
-            'datetime': undefined,
+            'info': response
         };
-        const data = this.safeValue (balances, 'account');
-        const account = this.account ();
-        account['free'] = this.safeString (data, 'freeCollateral');
-        account['total'] = this.safeString (data, 'equity');
-        result['code'] = account;
-        return this.parseBalance (account, false);
+        const balances = this.safeValue (response, 'accounts', []);
+        for (let i = 0; i < balances.length; i++) {
+            const balance = balances[i];
+            const account = this.account ();
+            account['free'] = this.safeString (balance, 'freeCollateral');
+            account['total'] = this.safeString (balance, 'equity');
+            result['USDC'] = account;
+        }
+        return this.parseBalance (result, false);
     }
 
     async fetchCanceledOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
@@ -499,12 +521,14 @@ module.exports = class dydx extends Exchange {
         return this.parseOHLCVs (data, market, timeframe, since, limit);
     }
 
-    async fetchOrder (id, symbol = undefined, params = {}) {
+    async fetchOrder (id, params = {}) {
         await this.loadMarkets ();
         const request = {
-            'id': parseInt (id),
+            'id': id
         };
-        const response = await this.privateGetOrders (this.extend (request, params));
+        params = this.omit (params, [ 'id' ]);
+        let method = 'privateGetOrdersId';
+        const response = await this[method] (this.extend (request, params));
         //
         // {
         //   "order": {
@@ -529,7 +553,8 @@ module.exports = class dydx extends Exchange {
         //   }
         // }
         //
-        return this.parseOrder (response);
+        const result = this.safeValue (response, 'order');
+        return this.parseOrder (result);
     }
 
     async fetchOrderBook (symbol, limit = undefined, params = {}) {
@@ -562,38 +587,47 @@ module.exports = class dydx extends Exchange {
 
     async fetchOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
         await this.loadMarkets ();
-        const market = this.market (symbol);
-        const request = {
-            'market': market['id'],
-            'limit': limit,
-            'createdBeforeOrAt': since,
-        };
+        const request = {};
+        if (symbol !== undefined) {
+            request['market'] = symbol;
+        }
+        if (limit !== undefined) {
+            request['limit'] = limit; // default 100, max 100
+        }
+        if (since !== undefined) {
+            request['createdBeforeOrAt'] = parseInt (since / 1000);
+        }
         const response = await this.privateGetOrders (this.extend (request, params));
         //
         // {
-        //   "order": {
-        //     "id": "foo",
-        //     "clientId": "foo",
-        //     "accountId": "afoo",
-        //     "market": "BTC-USD",
-        //     "side": "SELL",
-        //     "price": "29000",
-        //     "triggerPrice": null,
-        //     "trailingPercent": null,
-        //     "size": "0.500",
-        //     "remainingSize": "0.500",
-        //     "type": "LIMIT",
-        //     "createdAt": "2021-01-04T23:44:59.690Z",
-        //     "unfillableAt": null,
-        //     "expiresAt": "2021-02-04T23:44:59.690Z",
-        //     "status": "OPEN",
-        //     "timeInForce": "GTT",
-        //     "postOnly": false,
-        //     "cancelReason": null
-        //   }
+        //     "orders": [
+        //         {
+        //         "id": "id",
+        //         "clientId": "foo",
+        //         "accountId": "afoo",
+        //         "market": "BTC-USD",
+        //         "side": "SELL",
+        //         "price": "29000",
+        //         "triggerPrice": null,
+        //         "trailingPercent": null,
+        //         "size": "0.500",
+        //         "remainingSize": "0.500",
+        //         "type": "LIMIT",
+        //         "createdAt": "2021-01-04T23:44:59.690Z",
+        //         "unfillableAt": null,
+        //         "expiresAt": "2021-02-04T23:44:59.690Z",
+        //         "status": "OPEN",
+        //         "timeInForce": "GTT",
+        //         "postOnly": false,
+        //         "cancelReason": null
+        //         },
+        //         ...
+        //     ]
         // }
         //
-        return this.parseOrder (response);
+        // console.log(response);
+        const result = this.safeValue (response, 'orders', []);
+        return this.parseOrders (result, symbol, since, limit);
     }
 
     async fetchTrades (symbol, since = undefined, limit = undefined, params = {}) {
@@ -895,16 +929,17 @@ module.exports = class dydx extends Exchange {
         const status = this.parseOrderStatus (this.safeString (order, 'status'));
         const symbol = this.safeString (order, 'market');
         const clientId = this.safeString (order, 'clientId');
-        const timestamp = this.safeTimestamp (order, 'timestamp');
+        const timestamp = this.parse8601 (this.safeString (order, 'createdAt'));
         const price = this.safeNumber (order, 'price');
-        const amount = this.safeNumber (order, 'initial_amount');
+        const amount = this.safeNumber (order, 'size');
         const filled = this.safeNumber (order, 'processed_amount');
         const remaining = this.safeString (order, 'remainingSize');
         const cost = undefined;
         const type = this.safeString (order, 'type');
         const side = this.safeString (order, 'side');
         const timeInForce = this.safeString (order, 'timeInForce');
-        const stopPrice = this.safeNumber (order, 'trigger_price');
+        const stopPrice = this.safeNumber (order, 'triggerPrice');
+        const postOnly = this.safeValue (order, 'postOnly');
         const result = {
             'info': order,
             'id': id,
@@ -915,7 +950,7 @@ module.exports = class dydx extends Exchange {
             'symbol': symbol,
             'type': type,
             'timeInForce': timeInForce,
-            'postOnly': undefined,
+            'postOnly': postOnly,
             'side': side,
             'price': price,
             'stopPrice': stopPrice,
@@ -970,7 +1005,7 @@ module.exports = class dydx extends Exchange {
     sign (path, api = 'private', method = 'GET', params = {}, headers = undefined, body = undefined) {
         const version = this.safeString (this.options, 'version', 'v3');
         let url = this.urls['api']['private'] + '/' + version + '/' + this.implodeParams (path, params);
-        let requestPath = '/' + version + '/' + path;
+        let requestPath = '/' + version + '/' + this.implodeParams (path, params);
         let payload = undefined;
         headers = {
             'Content-Type': 'application/json',
@@ -979,6 +1014,7 @@ module.exports = class dydx extends Exchange {
         if (method === 'GET') {
             query = this.urlencode (params);
             url = url + ((query.length > 0) ? '?' + query : '');
+            requestPath = requestPath + ((query.length > 0) ? '?' + query : '');
         } else {
             body = this.json (params);
         }
@@ -998,7 +1034,7 @@ module.exports = class dydx extends Exchange {
                         timestamp +
                         method +
                         requestPath +
-                        ((!body) ? '' : JSON.stringify(body))
+                        ((!body) ? '' : body)
                     );
                     const signature = crypto.createHmac(
                         'sha256',
@@ -1006,8 +1042,8 @@ module.exports = class dydx extends Exchange {
                     ).update(messageString).digest('base64');
                     headers['DYDX-SIGNATURE'] = signature; // EIP-712-compliant Ethereum signature
                 }
-            } else if (method === 'DELETE') {
-                if (path === 'api-keys') {
+            } else if (path === 'api-keys') {
+                if (method === 'DELETE') {
                     // Ethereum Key Private Endpoints: POST, DELETE /v3/api-keys
                     headers['DYDX-TIMESTAMP'] = timestamp;
                     headers['DYDX-ETHEREUM-ADDRESS'] = this.ethereumAddress;
@@ -1019,7 +1055,7 @@ module.exports = class dydx extends Exchange {
                         timestamp +
                         method +
                         requestPath +
-                        ((!body) ? '' : JSON.stringify(body))
+                        ((!body) ? '' : body)
                     );
                     const signature = crypto.createHmac(
                         'sha256',
@@ -1037,7 +1073,7 @@ module.exports = class dydx extends Exchange {
                     timestamp +
                     method +
                     requestPath +
-                    ((!body) ? '' : JSON.stringify(body))
+                    ((!body) ? '' : body)
                 );
                 const signature = crypto.createHmac(
                     'sha256',
